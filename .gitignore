@@ -1,0 +1,6 @@
+__pycache__/
+.pytest_cache/
+.venv/
+resume_shortlisting.db
+*.db-journal
+.streamlit/secrets.toml

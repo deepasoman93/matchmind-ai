@@ -1,0 +1,63 @@
+MATCHMIND AI — NO-KEY ENHANCEMENT UPDATE
+=========================================
+
+This is an update to the existing project. Do not create a new project.
+
+FILES TO REPLACE
+----------------
+1. app.py
+2. resume_tailor.py
+3. requirements.txt
+4. README.md
+5. .streamlit/secrets.example.toml
+6. .streamlit/secrets.local.example.toml
+
+DO NOT REPLACE
+--------------
+- advanced_engine.py
+- database.py
+- document_parser.py
+
+WINDOWS POWERSHELL COMMANDS
+--------------------------
+1. Stop the running app with Ctrl+C.
+
+2. Extract this ZIP into your existing project folder and allow Windows to replace
+   only the files listed above.
+
+3. Open PowerShell in the project folder, then run:
+
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install -r requirements.txt
+   streamlit run app.py
+
+No API key, paid AI account or additional configuration is required for résumé
+enhancement. Google sign-in configuration is separate and remains optional.
+
+WHAT CHANGED
+------------
+- “Eligible” is now displayed as “Suitable for this Job”.
+- “Not Eligible” is now displayed as “Not Suitable for this Job”.
+- Resume checking, ranking, thresholds and experience handling are unchanged.
+- Built-in, evidence-based enhancement now works without any API key.
+- The output résumé is changed: the target role and verified job-matching evidence
+  are moved forward in the summary, and weak wording is strengthened safely.
+- No new skills, dates, metrics, job titles or qualifications are invented.
+- Enhancement preparation for multiple résumés runs concurrently.
+- Uploaded PDFs are no longer opened one-by-one in Microsoft Word.
+- One DOCX and one selectable/searchable PDF are produced for each suitable resume.
+- Blank-page and page-count checks run before the downloads are shown.
+- A visible progress bar and elapsed time are shown during enhancement.
+- Yes/No evidence questions use only Yes and No buttons. Questions requiring a
+  written answer use a text box. Confirmed and typed evidence is inserted into
+  the enhanced PDF and DOCX instead of being ignored.
+
+VALIDATION COMPLETED
+--------------------
+- 19 automated tests passed.
+- Two real two-page résumés completed in approximately 4 seconds total on the
+  validation computer without any external API.
+- Every generated PDF and DOCX page was rendered and visually inspected.
+- advanced_engine.py, database.py and document_parser.py checksums were unchanged.
+
+The previous 30-minute Microsoft Word PDF-import bottleneck has been removed.
