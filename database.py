@@ -17,7 +17,7 @@ PBKDF2_ITERATIONS = 600_000
 
 
 def connect() -> sqlite3.Connection:
-    connection = sqlite3.connect(DATABASE_PATH)
+    connection = sqlite3.connect(DATABASE_PATH, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     return connection
@@ -42,6 +42,10 @@ def initialize_database() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
         """)
+        # Streamlit Cloud may start more than one session at the same time.
+        # Serialize schema migrations so two sessions cannot add one column
+        # concurrently and make the second startup fail.
+        connection.execute("BEGIN IMMEDIATE")
         existing_columns = {
             row["name"] for row in connection.execute("PRAGMA table_info(users)").fetchall()
         }
