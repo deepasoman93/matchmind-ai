@@ -513,20 +513,6 @@ def show_login(app_role: str) -> None:
             if st.button("Continue with Google", type="primary", use_container_width=True):
                 st.login()
             st.markdown('<div class="cobalt-divider">or use your local account</div>', unsafe_allow_html=True)
-        else:
-            st.caption("Use your local username and password. Google sign-in can be enabled later.")
-            with st.expander("Google sign-in setup"):
-                st.markdown(
-                    """
-                    1. Open Google Cloud Console and create an **OAuth 2.0 Client ID** with application type **Web application**.
-                    2. Add `http://localhost:8501/oauth2callback` as an **Authorized redirect URI**.
-                    3. Copy `.streamlit/secrets.local.example.toml` to `.streamlit/secrets.toml`.
-                    4. Replace the three placeholder values with your Google Client ID, Client Secret and a long random cookie secret.
-                    5. Stop Streamlit with **Ctrl+C**, then run `streamlit run app.py` again.
-
-                    Never upload `secrets.toml` to GitHub or share its contents.
-                    """
-                )
 
         login_tab, register_tab = st.tabs(["Sign in", "Create account"])
         with login_tab:
