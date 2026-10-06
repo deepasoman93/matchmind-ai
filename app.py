@@ -778,13 +778,20 @@ def show_resume_tailoring(results) -> None:
         displayed_reason = reason.replace("Eligible:", "Suitable for this Job:")
         if eligible:
             st.success(f"✓ {row['Candidate']} — {displayed_reason}")
-            if candidate in context.get("resume_texts", {}):
+            if candidate in context.get("resume_texts", {}) and candidate in original_files:
                 tailoring_candidates.append(candidate)
             else:
-                st.info(f"{candidate}: run the analysis again so its complete résumé text is available for tailoring.")
+                st.info(
+                    f"{candidate}: upload the original PDF or DOCX and run the analysis again. "
+                    "The original file is required to preserve fonts, colours and layout."
+                )
         else:
             st.warning(f"✕ {row['Candidate']} — Not Suitable for this Job. {displayed_reason}")
-            if candidate_mode and candidate in context.get("resume_texts", {}):
+            if (
+                candidate_mode
+                and candidate in context.get("resume_texts", {})
+                and candidate in original_files
+            ):
                 tailoring_candidates.append(candidate)
 
     if not tailoring_candidates:
@@ -798,8 +805,8 @@ def show_resume_tailoring(results) -> None:
     )
     st.info(
         "The enhanced résumé includes one editable DOCX and one selectable, searchable PDF. "
-        "Text-based PDFs use fast structural conversion instead of the slow Microsoft Word PDF-import process. "
-        "Every final PDF page is rendered and checked automatically before the download is shown."
+        "Fonts, colours, headings, tables, columns, spacing and page design are retained from the uploaded file. "
+        "If that formatting cannot be retained safely, generation stops instead of producing a plain-text résumé."
     )
 
     st.success(

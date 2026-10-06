@@ -10,6 +10,7 @@ from collections import Counter
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
+from difflib import SequenceMatcher
 from html import escape as html_escape
 from io import BytesIO
 from pathlib import Path
@@ -17,7 +18,7 @@ from pathlib import Path
 import fitz
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml import OxmlElement
+from docx.oxml import OxmlElement, parse_xml
 from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 from reportlab.lib import colors
@@ -1126,6 +1127,7 @@ def _enhance_text_pdf_in_place(
             operations.setdefault(page_number, []).append({
                 "rect": union,
                 "text": revised_text,
+                "source_length": len(source_text),
                 "font_size": font_size,
                 "font_family": "serif" if is_serif else "sans-serif",
                 "font_weight": "bold" if is_bold else "normal",
@@ -1140,6 +1142,35 @@ def _enhance_text_pdf_in_place(
 
     for page_number, page_operations in operations.items():
         page = document[page_number]
+        # A model may return both a full multi-line rewrite and a rewrite of a
+        # sentence inside it. Applying both creates doubled/overlapping text.
+        # Keep the most complete rewrite for each occupied region.
+        non_overlapping: list[dict] = []
+        for operation in sorted(
+            page_operations,
+            key=lambda item: (item["source_length"], item["rect"].get_area()),
+            reverse=True,
+        ):
+            overlaps_existing = False
+            for selected in non_overlapping:
+                intersection = operation["rect"] & selected["rect"]
+                smaller_area = min(
+                    operation["rect"].get_area(),
+                    selected["rect"].get_area(),
+                )
+                if intersection.get_area() / max(smaller_area, 1.0) >= 0.20:
+                    overlaps_existing = True
+                    break
+            if overlaps_existing:
+                warnings.append(
+                    f"Skipped one overlapping rewrite on page {page_number + 1} to protect the original layout."
+                )
+                continue
+            non_overlapping.append(operation)
+        page_operations = sorted(
+            non_overlapping,
+            key=lambda item: (item["rect"].y0, item["rect"].x0),
+        )
         safe_operations = []
         for operation in page_operations:
             red, green, blue = operation["color"]
@@ -1172,7 +1203,9 @@ def _enhance_text_pdf_in_place(
                 )
 
         for operation in safe_operations:
-            page.add_redact_annot(operation["rect"], fill=(1, 1, 1))
+            # Remove only the replaced text. A transparent redaction retains
+            # coloured bars, shapes and other design elements behind the text.
+            page.add_redact_annot(operation["rect"], fill=None)
         if not safe_operations:
             continue
         page.apply_redactions(images=0, graphics=0)
@@ -1324,16 +1357,70 @@ def _move_body_footer_lines_to_page_footer(document: Document) -> None:
 
 
 def _set_paragraph_text_preserving_style(paragraph, text: str, focus_terms: list[str]) -> None:
-    """Replace one paragraph while retaining its paragraph style and first-run formatting."""
-    first_run_properties = deepcopy(paragraph.runs[0]._r.rPr) if paragraph.runs and paragraph.runs[0]._r.rPr is not None else None
-    for run in list(paragraph.runs):
+    """Rewrite paragraph text while retaining every original run's formatting.
+
+    Word frequently splits one résumé line into several runs with different font,
+    size, colour, bold, italic, underline, or language settings. Reusing only the
+    first run turns designed résumés into plain-looking documents. This mapping
+    keeps unchanged characters on their original runs and assigns newly written
+    characters the nearest source style.
+    """
+    del focus_terms  # Job focus comes from truthful wording, not new colour/bold markup.
+    original_runs = list(paragraph.runs)
+    if not original_runs:
+        paragraph.add_run(text)
+        return
+
+    source_text = "".join(run.text for run in original_runs)
+    run_properties = [
+        deepcopy(run._r.rPr) if run._r.rPr is not None else None
+        for run in original_runs
+    ]
+    source_styles: list[int] = []
+    for index, run in enumerate(original_runs):
+        source_styles.extend([index] * len(run.text))
+    if not source_styles:
+        source_styles = [0]
+
+    revised_styles: list[int] = []
+    matcher = SequenceMatcher(None, source_text, text, autojunk=False)
+    for tag, source_start, source_end, revised_start, revised_end in matcher.get_opcodes():
+        revised_length = revised_end - revised_start
+        if tag == "equal":
+            revised_styles.extend(source_styles[source_start:source_end])
+            continue
+        if revised_length <= 0:
+            continue
+        if source_start < len(source_styles):
+            nearest_style = source_styles[source_start]
+        elif source_start:
+            nearest_style = source_styles[min(source_start - 1, len(source_styles) - 1)]
+        else:
+            nearest_style = source_styles[0]
+        revised_styles.extend([nearest_style] * revised_length)
+
+    if len(revised_styles) != len(text):
+        revised_styles = [source_styles[0]] * len(text)
+
+    for run in original_runs:
         paragraph._p.remove(run._r)
-    for part, focused in _split_focus_text(text, focus_terms):
-        run = paragraph.add_run(part)
-        if first_run_properties is not None:
-            run._r.insert(0, deepcopy(first_run_properties))
-        if focused:
-            run.bold = True
+
+    start = 0
+    while start < len(text):
+        style_index = revised_styles[start]
+        end = start + 1
+        while end < len(text) and revised_styles[end] == style_index:
+            end += 1
+        run = paragraph.add_run(text[start:end])
+        properties = run_properties[style_index]
+        if properties is not None:
+            run._r.insert(0, deepcopy(properties))
+        start = end
+
+    if not text:
+        run = paragraph.add_run("")
+        if run_properties[0] is not None:
+            run._r.insert(0, deepcopy(run_properties[0]))
 
 
 def _find_rewrite_for_paragraph(paragraph_text: str, rewrite_map: dict[str, str]) -> str | None:
@@ -1535,6 +1622,423 @@ def _convert_pdf_to_docx_fast(source_bytes: bytes) -> bytes | None:
         return None
 
 
+_VML_NAMESPACES = (
+    'xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" '
+    'xmlns:v="urn:schemas-microsoft-com:vml" '
+    'xmlns:o="urn:schemas-microsoft-com:office:office" '
+    'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"'
+)
+
+
+def _pdf_colour_hex(colour: int | tuple | list | None, default: str = "000000") -> str:
+    if isinstance(colour, int):
+        return f"{(colour >> 16) & 255:02X}{(colour >> 8) & 255:02X}{colour & 255:02X}"
+    if isinstance(colour, (tuple, list)) and len(colour) >= 3:
+        return "".join(f"{max(0, min(255, round(float(value) * 255))):02X}" for value in colour[:3])
+    return default
+
+
+def _pdf_font_attributes(font_name: str, flags: int) -> tuple[str, bool, bool]:
+    cleaned = re.sub(r"^[A-Z]{6}\+", "", str(font_name or "Arial"))
+    lowered = cleaned.casefold()
+    bold = "bold" in lowered or bool(flags & 16)
+    italic = any(value in lowered for value in ("italic", "oblique")) or bool(flags & 2)
+    if "inriaserif" in lowered or "charissil" in lowered:
+        cleaned = "Nimbus Roman"
+    elif "times" in lowered:
+        cleaned = "Times New Roman"
+    elif "helvetica" in lowered:
+        cleaned = "Arial"
+    else:
+        cleaned = re.sub(r"[-,]?(bold|italic|oblique|regular)", "", cleaned, flags=re.IGNORECASE).strip(" -,")
+    if not cleaned:
+        cleaned = "Arial"
+    return cleaned, bold, italic
+
+
+def _append_positioned_text_box(
+    paragraph,
+    *,
+    shape_id: str,
+    text: str,
+    bbox,
+    page_width: float,
+    font_name: str,
+    font_size: float,
+    colour: str,
+    bold: bool,
+    italic: bool,
+) -> None:
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    y0 = max(0.0, y0 - max(1.0, font_size * 0.15))
+    # Transparent text boxes may safely overlap. Extending each one to the
+    # right page edge prevents Word/LibreOffice from wrapping a PDF text span
+    # merely because its substitute font has slightly different metrics.
+    width = max((page_width * 1.50) - x0, x1 - x0 + 6.0, 2.0)
+    height = max(y1 - y0 + 4.0, font_size * 2.1)
+    bold_xml = "<w:b/>" if bold else ""
+    italic_xml = "<w:i/>" if italic else ""
+    xml = f"""
+    <w:r {_VML_NAMESPACES}>
+      <w:pict>
+        <v:shape id="{shape_id}" type="#_x0000_t202" stroked="f" filled="f"
+          style="position:absolute;margin-left:{x0:.2f}pt;margin-top:{y0:.2f}pt;width:{width:.2f}pt;height:{height:.2f}pt;z-index:3;mso-position-horizontal-relative:page;mso-position-vertical-relative:page">
+          <v:textbox inset="0,0,0,0">
+            <w:txbxContent>
+              <w:p>
+                <w:pPr><w:spacing w:before="0" w:after="0" w:line="{max(20, round(font_size * 20))}" w:lineRule="exact"/></w:pPr>
+                <w:r>
+                  <w:rPr>
+                    <w:rFonts w:ascii="{html_escape(font_name, quote=True)}" w:hAnsi="{html_escape(font_name, quote=True)}"/>
+                    <w:color w:val="{colour}"/><w:sz w:val="{max(2, round(font_size * 2))}"/>
+                    {bold_xml}{italic_xml}
+                  </w:rPr>
+                  <w:t xml:space="preserve">{html_escape(text)}</w:t>
+                </w:r>
+              </w:p>
+            </w:txbxContent>
+          </v:textbox>
+        </v:shape>
+      </w:pict>
+    </w:r>
+    """
+    paragraph._p.append(parse_xml(xml))
+
+
+def _append_positioned_text_group(
+    paragraph,
+    *,
+    shape_id: str,
+    spans: list[dict],
+    page_width: float,
+) -> None:
+    """Place adjacent PDF spans in one Word textbox to prevent run overlap."""
+    if not spans:
+        return
+    x0 = min(float(span["bbox"][0]) for span in spans)
+    y0 = min(float(span["bbox"][1]) for span in spans)
+    y1 = max(float(span["bbox"][3]) for span in spans)
+    maximum_size = max(float(span.get("size", 9.0)) for span in spans)
+    source_line_width = max(float(span["bbox"][2]) for span in spans) - x0
+    available_line_width = max(page_width - x0, 1.0)
+    line_fill_ratio = source_line_width / available_line_width
+    serif_substitute_scale = 0.86 if line_fill_ratio >= 0.88 else 0.90
+    y0 = max(0.0, y0 - max(1.0, maximum_size * 0.15))
+    # PDF lines are already wrapped at their intended visual boundary. Give
+    # the Word textbox extra off-page width so a substitute font cannot wrap
+    # the same line again and collide with the following positioned line.
+    width = max((page_width * 1.50) - x0, 2.0)
+    height = max(y1 - y0 + 4.0, maximum_size * 2.1)
+
+    runs_xml: list[str] = []
+    previous_x1 = None
+    previous_text = ""
+    for span in spans:
+        span_x0 = float(span["bbox"][0])
+        raw_text = str(span.get("text", ""))
+        if (
+            previous_x1 is not None
+            and span_x0 - previous_x1 > 1.2
+            and previous_text
+            and not previous_text.endswith((" ", "\t"))
+            and raw_text
+            and not raw_text.startswith((" ", "\t", ",", ".", ":", ";", ")", "]"))
+        ):
+            raw_text = " " + raw_text
+        font_name, bold, italic = _pdf_font_attributes(
+            span.get("font", ""),
+            int(span.get("flags", 0)),
+        )
+        bold_xml = "<w:b/>" if bold else ""
+        italic_xml = "<w:i/>" if italic else ""
+        font_size = float(span.get("size", 9.0))
+        if any(
+            family in str(span.get("font", "")).casefold()
+            for family in ("inriaserif", "charissil")
+        ):
+            font_size *= serif_substitute_scale
+        runs_xml.append(
+            f"""
+            <w:r>
+              <w:rPr>
+                <w:rFonts w:ascii="{html_escape(font_name, quote=True)}" w:hAnsi="{html_escape(font_name, quote=True)}"/>
+                <w:color w:val="{_pdf_colour_hex(span.get('color', 0))}"/>
+                <w:sz w:val="{max(2, round(font_size * 2))}"/>
+                {bold_xml}{italic_xml}
+              </w:rPr>
+              <w:t xml:space="preserve">{html_escape(raw_text)}</w:t>
+            </w:r>
+            """
+        )
+        previous_x1 = float(span["bbox"][2])
+        previous_text = raw_text
+
+    xml = f"""
+    <w:r {_VML_NAMESPACES}>
+      <w:pict>
+        <v:shape id="{shape_id}" type="#_x0000_t202" stroked="f" filled="f"
+          style="position:absolute;margin-left:{x0:.2f}pt;margin-top:{y0:.2f}pt;width:{width:.2f}pt;height:{height:.2f}pt;z-index:3;mso-position-horizontal-relative:page;mso-position-vertical-relative:page">
+          <v:textbox inset="0,0,0,0">
+            <w:txbxContent>
+              <w:p>
+                <w:pPr><w:spacing w:before="0" w:after="0" w:line="{max(20, round(maximum_size * 20))}" w:lineRule="exact"/></w:pPr>
+                {''.join(runs_xml)}
+              </w:p>
+            </w:txbxContent>
+          </v:textbox>
+        </v:shape>
+      </w:pict>
+    </w:r>
+    """
+    paragraph._p.append(parse_xml(xml))
+
+
+def _append_positioned_drawing(paragraph, *, shape_id: str, drawing: dict) -> None:
+    rectangle = drawing.get("rect")
+    if rectangle is None:
+        return
+    x0, y0, x1, y1 = (float(value) for value in rectangle)
+    width = max(x1 - x0, 0.7)
+    height = max(y1 - y0, 0.7)
+    stroke = drawing.get("color")
+    fill = drawing.get("fill")
+    stroke_hex = _pdf_colour_hex(stroke)
+    fill_hex = _pdf_colour_hex(fill, "FFFFFF")
+    stroke_width = max(float(drawing.get("width") or 0.5), 0.35)
+    filled = "t" if fill is not None else "f"
+    stroked = "t" if stroke is not None else "f"
+    xml = f"""
+    <w:r {_VML_NAMESPACES}>
+      <w:pict>
+        <v:rect id="{shape_id}" filled="{filled}" fillcolor="#{fill_hex}"
+          stroked="{stroked}" strokecolor="#{stroke_hex}" strokeweight="{stroke_width:.2f}pt"
+          style="position:absolute;margin-left:{x0:.2f}pt;margin-top:{y0:.2f}pt;width:{width:.2f}pt;height:{height:.2f}pt;z-index:1;mso-position-horizontal-relative:page;mso-position-vertical-relative:page"/>
+      </w:pict>
+    </w:r>
+    """
+    paragraph._p.append(parse_xml(xml))
+
+
+def _append_positioned_image(document: Document, paragraph, *, shape_id: str, block: dict) -> None:
+    image_bytes = block.get("image")
+    bbox = block.get("bbox")
+    if not image_bytes or bbox is None:
+        return
+    try:
+        relationship_id, _ = document.part.get_or_add_image(BytesIO(image_bytes))
+    except Exception:
+        return
+    x0, y0, x1, y1 = (float(value) for value in bbox)
+    width = max(x1 - x0, 1.0)
+    height = max(y1 - y0, 1.0)
+    xml = f"""
+    <w:r {_VML_NAMESPACES}>
+      <w:pict>
+        <v:shape id="{shape_id}" type="#_x0000_t75" stroked="f"
+          style="position:absolute;margin-left:{x0:.2f}pt;margin-top:{y0:.2f}pt;width:{width:.2f}pt;height:{height:.2f}pt;z-index:2;mso-position-horizontal-relative:page;mso-position-vertical-relative:page">
+          <v:imagedata r:id="{relationship_id}" o:title=""/>
+        </v:shape>
+      </w:pict>
+    </w:r>
+    """
+    paragraph._p.append(parse_xml(xml))
+
+
+def _append_page_background(
+    document: Document,
+    paragraph,
+    *,
+    shape_id: str,
+    png_bytes: bytes,
+    page_width: float,
+    page_height: float,
+) -> None:
+    relationship_id, _ = document.part.get_or_add_image(BytesIO(png_bytes))
+    width_emu = max(int(page_width * 12700), 1)
+    height_emu = max(int(page_height * 12700), 1)
+    identifier_match = re.search(r"(\d+)$", shape_id)
+    drawing_id = int(identifier_match.group(1)) if identifier_match else 1
+    xml = f"""
+    <w:r xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+         xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+         xmlns:wp="http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing"
+         xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+         xmlns:pic="http://schemas.openxmlformats.org/drawingml/2006/picture">
+      <w:drawing>
+        <wp:anchor distT="0" distB="0" distL="0" distR="0" simplePos="0"
+                   relativeHeight="0" behindDoc="1" locked="0" layoutInCell="1" allowOverlap="1">
+          <wp:simplePos x="0" y="0"/>
+          <wp:positionH relativeFrom="page"><wp:posOffset>0</wp:posOffset></wp:positionH>
+          <wp:positionV relativeFrom="page"><wp:posOffset>0</wp:posOffset></wp:positionV>
+          <wp:extent cx="{width_emu}" cy="{height_emu}"/>
+          <wp:effectExtent l="0" t="0" r="0" b="0"/>
+          <wp:wrapNone/>
+          <wp:docPr id="{drawing_id}" name="{shape_id}"/>
+          <wp:cNvGraphicFramePr>
+            <a:graphicFrameLocks noChangeAspect="1"/>
+          </wp:cNvGraphicFramePr>
+          <a:graphic>
+            <a:graphicData uri="http://schemas.openxmlformats.org/drawingml/2006/picture">
+              <pic:pic>
+                <pic:nvPicPr>
+                  <pic:cNvPr id="{drawing_id}" name="{shape_id}.png"/>
+                  <pic:cNvPicPr><a:picLocks noChangeAspect="1" noChangeArrowheads="1"/></pic:cNvPicPr>
+                </pic:nvPicPr>
+                <pic:blipFill>
+                  <a:blip r:embed="{relationship_id}" cstate="print"/>
+                  <a:srcRect/>
+                  <a:stretch><a:fillRect/></a:stretch>
+                </pic:blipFill>
+                <pic:spPr bwMode="auto">
+                  <a:xfrm><a:off x="0" y="0"/><a:ext cx="{width_emu}" cy="{height_emu}"/></a:xfrm>
+                  <a:prstGeom prst="rect"><a:avLst/></a:prstGeom>
+                  <a:noFill/>
+                  <a:ln><a:noFill/></a:ln>
+                </pic:spPr>
+              </pic:pic>
+            </a:graphicData>
+          </a:graphic>
+        </wp:anchor>
+      </w:drawing>
+    </w:r>
+    """
+    paragraph._p.append(parse_xml(xml))
+
+
+def _render_graphics_only_page(source: fitz.Document, page_number: int) -> bytes:
+    """Render non-text design elements while keeping DOCX text fully editable."""
+    graphics_document = fitz.open()
+    graphics_document.insert_pdf(source, from_page=page_number, to_page=page_number)
+    page = graphics_document[0]
+    for block in page.get_text("dict").get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                rectangle = fitz.Rect(span["bbox"])
+                rectangle.x0 = max(page.rect.x0, rectangle.x0 - 0.5)
+                rectangle.y0 = max(page.rect.y0, rectangle.y0 - 0.5)
+                rectangle.x1 = min(page.rect.x1, rectangle.x1 + 0.5)
+                rectangle.y1 = min(page.rect.y1, rectangle.y1 + 0.5)
+                page.add_redact_annot(rectangle, fill=None)
+    page.apply_redactions(images=0, graphics=0)
+    pixmap = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5), alpha=False)
+    payload = pixmap.tobytes("png")
+    graphics_document.close()
+    return payload
+
+
+def _convert_pdf_to_positioned_docx(pdf_bytes: bytes) -> bytes:
+    """Recreate PDF pages as editable, selectable, positioned Word content.
+
+    Unlike paragraph-flow PDF converters, this retains columns, colours, text
+    placement, lines, boxes and images without flattening the résumé into a page
+    screenshot.
+    """
+    source = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if source.page_count == 0:
+        source.close()
+        raise ValueError("The PDF contains no pages.")
+
+    document = Document()
+    shape_counter = 0
+    for page_number, page in enumerate(source):
+        section = document.sections[-1]
+        section.page_width = Pt(page.rect.width)
+        section.page_height = Pt(page.rect.height)
+        section.top_margin = Pt(0)
+        section.bottom_margin = Pt(0)
+        section.left_margin = Pt(0)
+        section.right_margin = Pt(0)
+        section.header_distance = Pt(0)
+        section.footer_distance = Pt(0)
+
+        anchor = document.add_paragraph()
+        anchor.paragraph_format.space_before = Pt(0)
+        anchor.paragraph_format.space_after = Pt(0)
+        anchor.paragraph_format.line_spacing = Pt(1)
+
+        shape_counter += 1
+        _append_page_background(
+            document,
+            anchor,
+            shape_id=f"matchmind_background_{shape_counter}",
+            png_bytes=_render_graphics_only_page(source, page_number),
+            page_width=float(page.rect.width),
+            page_height=float(page.rect.height),
+        )
+
+        page_dict = page.get_text("dict")
+        for block in page_dict.get("blocks", []):
+            if block.get("type") == 1:
+                continue
+            for line in block.get("lines", []):
+                spans = [span for span in line.get("spans", []) if span.get("text", "")]
+                if not spans:
+                    continue
+                spans.sort(key=lambda span: float(span["bbox"][0]))
+                groups: list[list[dict]] = []
+                for span in spans:
+                    if not groups:
+                        groups.append([span])
+                        continue
+                    previous = groups[-1][-1]
+                    gap = float(span["bbox"][0]) - float(previous["bbox"][2])
+                    threshold = max(
+                        14.0,
+                        float(span.get("size", 9.0)) * 1.5,
+                        float(previous.get("size", 9.0)) * 1.5,
+                    )
+                    if gap > threshold:
+                        groups.append([span])
+                    else:
+                        groups[-1].append(span)
+                for group in groups:
+                    shape_counter += 1
+                    _append_positioned_text_group(
+                        anchor,
+                        shape_id=f"matchmind_text_{shape_counter}",
+                        spans=group,
+                        page_width=float(page.rect.width),
+                    )
+
+        if page_number < source.page_count - 1:
+            document.add_page_break()
+
+    source.close()
+    output = BytesIO()
+    document.save(output)
+    return output.getvalue()
+
+
+def _convert_pdf_to_docx_with_word(source_bytes: bytes, word_application) -> bytes | None:
+    """Use an existing Word session only when fast structural conversion fails."""
+    if word_application is None:
+        return None
+    document = None
+    try:
+        with tempfile.TemporaryDirectory(prefix="matchmind_pdf_word_fallback_") as directory:
+            source_path = Path(directory) / "source.pdf"
+            output_path = Path(directory) / "source.docx"
+            source_path.write_bytes(source_bytes)
+            document = word_application.Documents.Open(
+                str(source_path.resolve()),
+                ConfirmConversions=False,
+                ReadOnly=False,
+                AddToRecentFiles=False,
+            )
+            document.SaveAs2(str(output_path.resolve()), FileFormat=16)
+            document.Close(False)
+            document = None
+            return output_path.read_bytes() if output_path.exists() else None
+    except Exception:
+        return None
+    finally:
+        if document is not None:
+            try:
+                document.Close(False)
+            except Exception:
+                pass
+
+
 def _inspect_searchable_pdf(pdf_bytes: bytes, expected_pages: int | None = None) -> dict:
     """Render every page and verify searchable text, blank pages and page count."""
     document = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -1700,8 +2204,14 @@ def create_enhanced_resume_files(
     preserved_docx = None
     preserved_pdf = None
     pdf_rewrite_warnings: list[str] = []
+    preservation_warnings: list[str] = []
     expected_pdf_pages = None
-    layout_note = "A clean monochrome ATS-readable layout was used."
+    layout_note = "The source file did not contain a reusable visual layout."
+    if source_extension in {".docx", ".pdf"} and not source_bytes:
+        raise ValueError(
+            "The original résumé file is unavailable. Upload it again so MatchMind can preserve its formatting."
+        )
+
     if source_name and source_bytes and source_extension == ".docx":
         preserved_docx = _enhance_source_docx(
             candidate_name,
@@ -1709,40 +2219,44 @@ def create_enhanced_resume_files(
             content["focus_terms"],
             tailoring_result=tailoring_result,
         )
-        if preserved_docx:
-            layout_note = "The uploaded DOCX structure, paragraph styles, spacing and page settings were retained."
+        if not preserved_docx:
+            raise ValueError(
+                "The uploaded DOCX could not be enhanced without losing its formatting. "
+                "No generic résumé was created."
+            )
+        layout_note = (
+            "The uploaded DOCX structure, fonts, colours, paragraph styles, tables, spacing and page settings were retained."
+        )
     elif source_name and source_bytes and source_extension == ".pdf":
         text_based, expected_pdf_pages = _pdf_text_page_count(source_bytes)
-        if text_based:
+        if not text_based:
+            raise ValueError(
+                "This PDF is image-based. Upload the editable DOCX or a text-based PDF so the résumé can remain "
+                "selectable and preserve its design. No notepad-style fallback was created."
+            )
+        try:
             pdf_name, pdf_bytes, pdf_rewrite_warnings = _enhance_text_pdf_in_place(
                 candidate_name,
                 source_bytes,
                 tailoring_result,
             )
             preserved_pdf = (pdf_name, pdf_bytes)
-        converted_docx = _convert_pdf_to_docx_fast(source_bytes) if text_based else None
-        if converted_docx:
-            preserved_docx = _enhance_source_docx(
-                candidate_name,
-                converted_docx,
-                content["focus_terms"],
-                tailoring_result=tailoring_result,
+        except Exception:
+            preserved_pdf = (f"{_safe_filename(candidate_name)}_enhanced.pdf", source_bytes)
+            preservation_warnings.append(
+                "One safe in-place PDF rewrite could not be completed, so the original designed PDF was retained "
+                "instead of creating a generic résumé."
             )
-            if preserved_docx:
-                layout_note = (
-                    "The tailored PDF keeps the original searchable pages and page count. The editable DOCX was "
-                    "structurally recreated without using Word's slow PDF-import operation."
-                )
-        elif not text_based:
-            layout_note = (
-                "The uploaded PDF was image based, so its OCR text was rebuilt into a clean selectable ATS layout "
-                "without embedding the page images."
-            )
-        else:
-            layout_note = (
-                "Fast structural PDF conversion was unavailable, so a clean selectable ATS layout was used "
-                "instead of the slow Word PDF-import path."
-            )
+
+        positioned_docx = _convert_pdf_to_positioned_docx(preserved_pdf[1])
+        preserved_docx = (
+            f"{_safe_filename(candidate_name)}_enhanced.docx",
+            positioned_docx,
+        )
+        layout_note = (
+            "The tailored PDF retains the original fonts, colours, graphics, page dimensions and page count. "
+            "The editable DOCX recreates the same design with positioned, selectable text rather than page screenshots."
+        )
 
     docx_name, docx_bytes = preserved_docx or create_enhanced_docx(candidate_name, content)
     word_pdf = None
@@ -1760,43 +2274,25 @@ def create_enhanced_resume_files(
             expected_pages=expected_pdf_pages if preserved_docx and source_extension == ".pdf" else None,
         )
 
-    if source_extension == ".pdf" and preserved_docx and docx_render_quality and not docx_render_quality["passed"]:
-        content["page_break_after_sources"] = _pdf_page_break_sources(source_bytes)
-        docx_name, docx_bytes = create_enhanced_docx(candidate_name, content)
-        word_pdf = None
-        if word_application is not None or start_word_if_needed:
-            word_pdf = _create_pdf_with_microsoft_word(
-                candidate_name,
-                docx_bytes,
-                word_application=word_application,
-            )
-        office_pdf = word_pdf or _create_pdf_with_libreoffice(candidate_name, docx_bytes)
-        docx_render_quality = _inspect_searchable_pdf(
-            office_pdf[1],
-            expected_pages=expected_pdf_pages,
-        ) if office_pdf else None
-        layout_note += " The first DOCX conversion failed page-structure review, so the DOCX was automatically rebuilt page by page."
+    if source_extension == ".pdf" and docx_render_quality and not docx_render_quality["passed"]:
+        preservation_warnings.append(
+            "The editable DOCX did not exactly match the PDF page structure during automated review; its converted "
+            "design was retained rather than replaced with a generic layout."
+        )
 
-    requires_reflow = bool(
-        tailoring_result.get("verified_skills")
-        or tailoring_result.get("section_additions")
-    )
-    use_reflowed_pdf = bool(
-        requires_reflow
-        and office_pdf
-        and docx_render_quality
-        and docx_render_quality["passed"]
-    )
     if source_extension == ".pdf" and preserved_pdf:
         pdf_name, pdf_bytes = preserved_pdf
-        layout_note = "The original PDF styling, page dimensions and page count were retained while safe in-place wording changes were applied."
         if tailoring_result.get("section_additions"):
             pdf_rewrite_warnings.append(
                 "A verified free-text addition was not appended as a new PDF block because preserving the original layout and page count takes priority."
             )
-    elif use_reflowed_pdf:
+    elif source_extension == ".docx" and office_pdf:
         pdf_name, pdf_bytes = office_pdf
-        layout_note += " New verified facts were placed inside their relevant existing sections and the document was reflowed within the original page count."
+    elif source_extension == ".docx":
+        raise ValueError(
+            "The enhanced DOCX was created with its original formatting, but a matching PDF could not be exported. "
+            "Install Microsoft Word locally or include LibreOffice in the deployment. No generic PDF was created."
+        )
     else:
         pdf_name, pdf_bytes = office_pdf or create_enhanced_pdf(candidate_name, content)
     pdf_bytes = _remove_blank_pdf_pages(pdf_bytes)
@@ -1804,7 +2300,15 @@ def create_enhanced_resume_files(
         pdf_bytes,
         expected_pages=expected_pdf_pages if source_extension == ".pdf" else None,
     )
-    warning_messages = [message for message in (tailoring_result.get("warning"), *pdf_rewrite_warnings) if message]
+    warning_messages = [
+        message
+        for message in (
+            tailoring_result.get("warning"),
+            *preservation_warnings,
+            *pdf_rewrite_warnings,
+        )
+        if message
+    ]
     return {
         "docx_name": docx_name,
         "docx_bytes": docx_bytes,

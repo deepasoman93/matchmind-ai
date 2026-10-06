@@ -69,25 +69,31 @@ Questions requiring information use a text box. Affirmative confirmations and
 typed evidence are inserted into the enhanced résumé rather than merely stored.
 Confirmed missing skills are forced into the Technical Skills section even when
 the uploaded DOCX uses a table-based layout. Text-based PDF résumés are edited
-in place so their styling, page dimensions and page count remain unchanged.
+in place so their styling, colours, graphics, page dimensions and page count
+remain unchanged. Their editable DOCX uses positioned, selectable text over the
+original non-text design layer, so it remains a résumé rather than becoming a
+plain/notepad document or a page screenshot.
 Free-text answers with no clear connection to the job or existing résumé are
 reported as skipped instead of being inserted into professional experience.
 
 There are no coloured keyword blocks, no filtered-out sections and no invented
 claims. No OpenAI key or external AI account is required. New numbers and new
-skills are never added. DOCX uploads are edited in place to retain paragraph
-styles and page settings. Text-based PDF uploads use fast structural conversion
-to editable DOCX instead of Microsoft Word's slow PDF-import operation. Scanned
-PDFs are rebuilt from OCR text without embedding page images. The final PDF is
-exported from the tailored DOCX, rendered page by page, and checked for
-selectable text, blank pages and page-count consistency.
+skills are never added. DOCX uploads are edited in place while retaining run
+fonts, colours, bold/italic styling, paragraph styles, tables, spacing and page
+settings. Text-based PDF uploads use a fast layout-preserving conversion to an
+editable DOCX instead of Microsoft Word's slow PDF-import operation. Image-only
+or scanned PDFs are stopped with a clear request for the editable DOCX or a
+text-based PDF; MatchMind does not silently create a generic résumé. PDFs are
+rendered page by page and checked for selectable text, blank pages and page-count
+consistency.
 
 Eligibility requires at least 50% overall job match, at least 50% required-skill
 coverage, and the required experience stated by the job description. Job
 Description Match is explanatory; it is not an additional rejection gate. An
-explicit 3-5 year range accepts 3, 4 or 5 detected years. A single value such as
-"1 year experience" is treated as a minimum, so a candidate with more experience
-is not rejected as overqualified.
+ordinary preferred range such as 2-3 years accepts candidates from 2 through 6
+years, so a four-year mid-level candidate is not rejected as overqualified. The
+upper value remains strict only when the job explicitly says maximum, up to, at
+most or equivalent wording.
 
 ## Windows setup
 
@@ -111,8 +117,9 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 streamlit run app.py
 ```
 
-The transformer downloads on first use. EasyOCR downloads its English OCR
-weights only when a scanned document requires OCR.
+The transformer downloads on first use. EasyOCR may extract scanned documents
+for matching, but formatting-preserving enhancement still requires the editable
+DOCX or a text-based PDF.
 
 During matching and resume generation, the interface displays the current
 loading step and progress instead of appearing frozen.
@@ -121,6 +128,10 @@ Enhancement preparation for up to three candidates runs concurrently. One hidden
 Microsoft Word session is then reused only for the fast final DOCX-to-PDF
 exports. Uploaded PDFs are never opened in Word, removing the operation that
 previously caused 30-minute waits.
+
+On Streamlit Community Cloud, the root `packages.txt` installs LibreOffice
+Writer and compatible fonts so a formatting-matched PDF can be exported from an
+uploaded DOCX. Keep this file in the repository when deploying the update.
 
 ## Enable Google sign-in on a local PC
 

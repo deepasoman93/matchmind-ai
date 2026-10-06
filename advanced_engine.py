@@ -10,6 +10,7 @@ from sklearn.metrics.pairwise import cosine_similarity
 
 
 MODEL_NAME = "sentence-transformers/all-mpnet-base-v2"
+EXPERIENCE_RANGE_TOLERANCE_YEARS = 3
 SKILL_ALIASES = {
     "power bi": ["power bi", "powerbi"], "business intelligence": ["business intelligence", "bi reporting"],
     "python": ["python"], "sql": ["sql", "t-sql", "mysql", "postgresql"], "pandas": ["pandas"],
@@ -88,13 +89,21 @@ def extract_required_experience_range(text: str) -> tuple[int | None, int | None
     if valid_ranges:
         return min(valid_ranges, key=lambda item: item[0])
 
+    ceiling_values = re.findall(
+        r"(?:maximum|max|up to|at most|no more than|not more than)\s*(?:of\s*)?(\d{1,2})\s*(?:years?|yrs?)",
+        normalized,
+    )
+    valid_ceilings = [int(value) for value in ceiling_values if int(value) <= 50]
+    if valid_ceilings:
+        return 0, min(valid_ceilings)
+
     values = re.findall(r"(\d{1,2})\+?\s*(?:years?|yrs?)", clean_text(text))
     valid = [int(value) for value in values if int(value) <= 50]
     if not valid:
         return None, None
     minimum = min(valid)
     # A single value such as "1 year experience" states the minimum required
-    # experience. Only an explicit range such as "1-2 years" supplies a maximum.
+    # experience. Only an explicit range supplies a preferred upper boundary.
     return minimum, None
 
 
@@ -102,6 +111,17 @@ def extract_candidate_years(text: str) -> int | None:
     values = re.findall(r"(\d{1,2})\+?\s*(?:years?|yrs?)", clean_text(text))
     valid = [int(value) for value in values if int(value) <= 50]
     return max(valid) if valid else None
+
+
+def has_explicit_experience_ceiling(text: str, maximum_years: int) -> bool:
+    """Return True only when the JD clearly states a hard maximum."""
+    normalized = clean_text(text)
+    years = rf"{maximum_years}\s*(?:years?|yrs?)"
+    patterns = (
+        rf"(?:maximum|max|up to|at most|no more than|not more than)\s*(?:of\s*)?{years}",
+        rf"{years}\s*(?:maximum|max)",
+    )
+    return any(re.search(pattern, normalized) for pattern in patterns)
 
 
 def education_level(text: str) -> tuple[int, str]:
@@ -215,7 +235,7 @@ def tailoring_eligibility(
     minimum_match: float = 50.0,
     minimum_skill_coverage: float = 50.0,
 ) -> tuple[bool, str]:
-    """Require overall JD match, skill coverage, and experience-range alignment."""
+    """Apply the approved match gates and a practical experience-band policy."""
     match_score = float(result_row.get("Match %", result_row["Semantic %"]))
     semantic_score = float(result_row["Semantic %"])
     skill_score = float(result_row["Skill coverage %"])
@@ -235,15 +255,38 @@ def tailoring_eligibility(
     candidate_years = int(candidate_years)
     if candidate_years < minimum_years:
         return False, f"Requires at least {minimum_years} years; detected {candidate_years}."
-    if maximum_years is not None and candidate_years > maximum_years:
-        return False, (
-            f"Requires {minimum_years}–{maximum_years} years; detected {candidate_years}."
+
+    if maximum_years is not None:
+        explicit_ceiling = has_explicit_experience_ceiling(job_description, maximum_years)
+        accepted_maximum = (
+            maximum_years
+            if explicit_ceiling
+            else maximum_years + EXPERIENCE_RANGE_TOLERANCE_YEARS
         )
+        if candidate_years > accepted_maximum:
+            if explicit_ceiling:
+                return False, (
+                    f"Requires a maximum of {maximum_years} years; detected {candidate_years}."
+                )
+            return False, (
+                f"Preferred experience is {minimum_years}–{maximum_years} years and "
+                f"this role accepts up to {accepted_maximum} years; detected {candidate_years}."
+            )
+
     requirement = f"{minimum_years}+" if maximum_years is None else (
         str(minimum_years) if minimum_years == maximum_years else f"{minimum_years}–{maximum_years}"
     )
+    if maximum_years is not None and candidate_years > maximum_years:
+        experience_message = (
+            f"experience {candidate_years} years meets the minimum and is above the preferred "
+            f"{requirement}-year range (accepted up to "
+            f"{maximum_years + EXPERIENCE_RANGE_TOLERANCE_YEARS} years)."
+        )
+    else:
+        experience_message = (
+            f"experience {candidate_years} years meets the {requirement}-year requirement."
+        )
     return True, (
         f"Eligible: overall match {match_score:.1f}%, job description match {semantic_score:.1f}%, "
-        f"skills {skill_score:.1f}%, "
-        f"experience {candidate_years} years within the {requirement}-year requirement."
+        f"skills {skill_score:.1f}%, {experience_message}"
     )

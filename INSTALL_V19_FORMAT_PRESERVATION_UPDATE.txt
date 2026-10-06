@@ -1,0 +1,77 @@
+MATCHMIND AI — V19 FORMAT-PRESERVING ENHANCEMENT UPDATE
+========================================================
+
+This is an update for the existing MatchMind project. It does not create a new
+database and it does not require an OpenAI/API key.
+
+FILES TO REPLACE OR ADD
+-----------------------
+1. app.py
+2. resume_tailor.py
+3. advanced_engine.py
+4. packages.txt
+5. README.md
+6. verify_format_preservation.py
+
+DO NOT REPLACE OR DELETE
+------------------------
+- database.py or any database file
+- .streamlit/secrets.toml
+- uploaded data, user accounts or saved results
+- your virtual environment
+
+WINDOWS / LOCAL UPDATE
+----------------------
+1. Stop Streamlit with Ctrl+C.
+2. Back up the current files listed under FILES TO REPLACE OR ADD.
+3. Copy the six update files into the existing project folder and allow those
+   files only to be replaced.
+4. Open PowerShell in the project folder and run:
+
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install -r requirements.txt
+   python verify_format_preservation.py
+   python -m streamlit run app.py
+
+Microsoft Word is used for a matching PDF export when available. Otherwise,
+install LibreOffice locally. Streamlit Community Cloud installs LibreOffice
+automatically from packages.txt.
+
+GITHUB / STREAMLIT CLOUD UPDATE
+-------------------------------
+1. Copy the six update files into the GitHub repository root.
+2. Commit and push them. Keep packages.txt at the repository root.
+3. Reboot the Streamlit app if it does not redeploy automatically.
+4. Upload the original PDF or DOCX and run the analysis again once. Older saved
+   analyses may not contain the original file bytes needed to retain design.
+
+WHAT CHANGED
+------------
+- An uploaded DOCX is edited in place while retaining fonts, colours, mixed-run
+  bold/italic styling, paragraph styles, tables, columns, spacing and page setup.
+- A text-based PDF is enhanced on its original pages. Its PDF keeps the original
+  graphics, colours, dimensions, page count and selectable text.
+- The PDF's editable DOCX recreates the same page design with positioned,
+  selectable text plus the original non-text visual layer. It is not a page
+  screenshot and it is not a plain/notepad résumé.
+- Overlapping AI rewrites are de-duplicated so text is not printed twice.
+- If the design cannot be preserved, generation stops with a clear message. It
+  no longer silently creates a generic résumé.
+- Image-only/scanned PDFs require the editable DOCX or a text-based PDF for
+  formatting-preserving enhancement.
+- Ordinary 2–3-year requirements accept 2 through 6 detected years. A four-year
+  mid-level candidate is therefore suitable. A strict upper limit applies only
+  when the job explicitly says maximum, up to, at most or equivalent wording.
+- Match score composition, ranking and the 50% overall/50% skill gates are
+  unchanged.
+
+VERIFICATION COMPLETED
+----------------------
+- Python compilation passed.
+- DOCX run fonts, colours, tables, margins, styles and theme were retained.
+- PDF colours, graphics, dimensions, searchable text and page count were retained.
+- PDF-to-DOCX output retained editable text and the original visual design layer.
+- The no-generic-fallback behavior passed.
+- The four-year candidate / 2–3-year role suitability rule passed.
+- Two different real two-page résumés were rendered and visually reviewed in
+  both PDF and DOCX form with no blank pages.
